@@ -7,6 +7,7 @@ from inspect import isfunction
 from functools import partial
 
 from torch.utils import data
+from torch.autograd import Variable
 from pathlib import Path
 from torch.optim import Adam
 from torchvision import transforms, utils
@@ -192,6 +193,7 @@ class Unet(nn.Module):
         self,
         dim,
         image_size,
+        timesteps,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
         groups = 8,
@@ -204,12 +206,10 @@ class Unet(nn.Module):
         dims = [channels, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-
         ####
         self.flatten = nn.Flatten()
-        self.sigma_mlp1 = nn.Linear(512 * int(image_size/8) * int(image_size/8), 512)
-        self.sigma_mlp2 = nn.Linear(512, 64)
-        self.sigma_mlp3 = nn.Linear(64, 1)
+        self.step_mlp1 = nn.Linear(512 * int(image_size / 8) * int(image_size / 8), timesteps)
+        #self.step_mlp2 = nn.Linear(2000, timesteps)
         ####
 
         if with_time_emb:
@@ -275,12 +275,8 @@ class Unet(nn.Module):
         x = self.mid_attn(x)
         x = self.mid_block2(x, t)
 
-        sigma = self.flatten(x)
-        sigma = self.sigma_mlp1(sigma)
-        sigma = self.sigma_mlp2(sigma)
-        sigma = self.sigma_mlp3(sigma)
-        #print(x.shape)
-        # print(t.shape)
+        step = self.flatten(x)
+        step = self.step_mlp1(step)
 
         for resnet, resnet2, attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim=1)
@@ -289,7 +285,7 @@ class Unet(nn.Module):
             x = attn(x)
             x = upsample(x)
 
-        return self.final_conv(x), sigma
+        return self.final_conv(x), step
 
 # gaussian diffusion trainer class
 
@@ -390,21 +386,21 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(self, x, t, clip_denoised: bool):
-        noise, sigma = self.denoise_fn(x, t)
+        noise, t = self.denoise_fn(x, t)
+        _, t = t.max(1)
         x_recon = self.predict_start_from_noise(x, t=t, noise=noise)
+        print(t)
 
         if clip_denoised:
             x_recon.clamp_(-1., 1.)
 
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
-        sigma = sigma.unsqueeze(1)
-        sigma = sigma.unsqueeze(1)
-        return model_mean, posterior_variance, posterior_log_variance, sigma
+        return model_mean, posterior_variance, posterior_log_variance
 
     @torch.no_grad()
     def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
         b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance, sigma = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
+        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
         noise = noise_like(x.shape, device, repeat_noise)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
@@ -456,12 +452,13 @@ class GaussianDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        x_recon, sigma = self.denoise_fn(x_noisy, t)
-        posterior_log_variance = extract(self.posterior_log_variance_clipped, t, x_recon.shape)
+        x_recon, step = self.denoise_fn(x_noisy, t)
 
-        sigma_t = (0.5 * posterior_log_variance).exp()
+        criterion = torch.nn.CrossEntropyLoss().cuda()
+        loss_step = criterion(step, t)
 
-        loss_sigma = (sigma - sigma_t).abs().mean() + 0.5*F.mse_loss(sigma_t, sigma)
+        _, predicted = step.max(1)
+        correct = predicted.eq(t).sum().item()
 
         if self.loss_type == 'l1':
             loss = (noise - x_recon).abs().mean()
@@ -470,7 +467,7 @@ class GaussianDiffusion(nn.Module):
         else:
             raise NotImplementedError()
 
-        return loss, loss_sigma
+        return loss, loss_step, correct
 
     def forward(self, x, *args, **kwargs):
         b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
@@ -479,6 +476,271 @@ class GaussianDiffusion(nn.Module):
         return self.p_losses(x, t, *args, **kwargs)
 
 # dataset classes
+
+class GaussianDiffusionIter(nn.Module):
+    def __init__(
+        self,
+        denoise_fn,
+        *,
+        image_size,
+        channels = 3,
+        timesteps = 1000,
+        loss_type = 'l1',
+        betas = None
+    ):
+        super().__init__()
+        self.channels = channels
+        self.image_size = image_size
+        self.denoise_fn = denoise_fn
+
+        if exists(betas):
+            betas = betas.detach().cpu().numpy() if isinstance(betas, torch.Tensor) else betas
+        else:
+            betas = cosine_beta_schedule(timesteps)
+
+        alphas = 1. - betas
+        alphas_cumprod = np.cumprod(alphas, axis=0)
+        alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        self.loss_type = loss_type
+
+        to_torch = partial(torch.tensor, dtype=torch.float32)
+
+        self.register_buffer('betas', to_torch(betas))
+        self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
+        self.register_buffer('alphas_cumprod_prev', to_torch(alphas_cumprod_prev))
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))
+        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod)))
+        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))
+        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))
+
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+        self.register_buffer('posterior_variance', to_torch(posterior_variance))
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+        self.register_buffer('posterior_log_variance_clipped', to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
+        self.register_buffer('posterior_mean_coef1', to_torch(
+            betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
+        self.register_buffer('posterior_mean_coef2', to_torch(
+            (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
+
+    def q_mean_variance(self, x_start, t):
+        mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+        variance = extract(1. - self.alphas_cumprod, t, x_start.shape)
+        log_variance = extract(self.log_one_minus_alphas_cumprod, t, x_start.shape)
+        return mean, variance, log_variance
+
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def q_posterior(self, x_start, x_t, t):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_mean_variance(self, x, t, clip_denoised: bool):
+        noise, t = self.denoise_fn(x, t)
+        _, t = t.max(1)
+        x_recon = self.predict_start_from_noise(x, t=t, noise=noise)
+        # print(t.float().mean())
+
+        if clip_denoised:
+            x_recon.clamp_(-1., 1.)
+
+        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
+        return model_mean, posterior_variance, posterior_log_variance, t
+
+    @torch.no_grad()
+    def p_sample(self, x, t, done_mask, clip_denoised=True, repeat_noise=False):
+        b, *_, device = *x.shape, x.device
+
+        model_mean, _, model_log_variance, t = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
+        noise = noise_like(x.shape, device, repeat_noise)
+        # no noise when t == 0
+        nonzero_mask = (1 - (t == 0).float()).reshape(t.shape[0], *((1,) * (len(x.shape) - 1)))
+        x_next = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
+
+        x_next = x_next * done_mask  # zero the already done ones
+        x = x * (1 - done_mask)  # take the one that are already done
+        x_next = x_next + x
+
+        new_done_mask = (1 - (t == 0).float()).reshape(t.shape[0], *((1,) * (len(x.shape) - 1)))
+        done_mask = done_mask * new_done_mask
+
+        return x_next, done_mask
+
+    @torch.no_grad()
+    def p_sample_loop(self, shape, img=None):
+        device = self.betas.device
+
+        b = shape[0]
+        if img == None:
+            img = torch.randn(shape, device=device)
+
+        t = torch.full((b,), self.num_timesteps, device=device, dtype=torch.long)
+        done_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(img.shape) - 1)))
+
+        for i in tqdm(reversed(range(0, 2*self.num_timesteps)), desc='sampling loop time step', total=2*self.num_timesteps):
+            img, done_mask = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long), done_mask)
+            if torch.sum(done_mask) == 0:
+                break
+        return img
+
+    @torch.no_grad()
+    def sample(self, batch_size = 16):
+        image_size = self.image_size
+        channels = self.channels
+        return self.p_sample_loop((batch_size, channels, image_size, image_size))
+
+    @torch.no_grad()
+    def sample_from_img(self, batch_size=16, img=None):
+        image_size = self.image_size
+        channels = self.channels
+        return self.p_sample_loop((batch_size, channels, image_size, image_size), img)
+
+    @torch.no_grad()
+    def sample_x0(self, batch_size=16):
+
+        image_size = self.image_size
+        channels = self.channels
+        shape = (batch_size, channels, image_size, image_size)
+        device = self.betas.device
+
+        img = torch.randn(shape).cuda()
+        t = torch.full((shape[0],), self.num_timesteps, device=device, dtype=torch.long)
+        done_mask = (1 - (t == 0).float()).reshape(shape[0], *((1,) * (len(img.shape) - 1)))
+
+
+        for i in range(100):
+            noise, t = self.denoise_fn(img, None)
+            _, t = t.max(1)
+            print(t)
+            x_next = self.predict_start_from_noise(img, t=t, noise=noise)
+
+            x_next = x_next * done_mask  # zero the already done ones
+            img = img * (1 - done_mask)  # take the one that are already done
+            img = x_next + img
+
+            new_done_mask = (1 - (t == 0).float()).reshape(t.shape[0], *((1,) * (len(img.shape) - 1)))
+            done_mask = done_mask * new_done_mask
+            if torch.sum(done_mask) == 0:
+                break
+
+        return img
+
+
+    def sample_opt(self, batch_size=16):
+
+        image_size = self.image_size
+        channels = self.channels
+        shape = (batch_size, channels, image_size, image_size)
+        device = self.betas.device
+        img = torch.randn(shape).cuda()
+        img_v = Variable(img, requires_grad=True)
+        optim = torch.optim.Adam([img_v], lr=0.001)
+        criterion = torch.nn.CrossEntropyLoss().cuda()
+
+        t_target = torch.full((batch_size,), 0, device=device, dtype=torch.long)
+
+        for j in range(1000):
+            _, t = self.denoise_fn(img_v, None)
+            loss = criterion(t, t_target)
+
+            loss.backward()
+            optim.step()
+            optim.zero_grad()
+
+            _, t = t.max(1)
+            print(t)
+            print(loss)
+
+        # i=900
+        # while(i!=0):
+        #     print("#################")
+        #     t_target = torch.full((batch_size,), i, device=device, dtype=torch.long)
+        #
+        #     for j in range(100):
+        #         _, t = self.denoise_fn(img_v, None)
+        #         loss = criterion(t, t_target)
+        #
+        #         loss.backward()
+        #         optim.step()
+        #         optim.zero_grad()
+        #
+        #         _, t = t.max(1)
+        #         print(t)
+        #         print(loss)
+        #
+        #     i=i-100
+
+        return img_v.data
+
+
+    @torch.no_grad()
+    def interpolate(self, x1, x2, t = None, lam = 0.5):
+        b, *_, device = *x1.shape, x1.device
+        t = default(t, self.num_timesteps - 1)
+
+        assert x1.shape == x2.shape
+
+        t_batched = torch.stack([torch.tensor(t, device=device)] * b)
+        xt1, xt2 = map(lambda x: self.q_sample(x, t=t_batched), (x1, x2))
+
+        img = (1 - lam) * xt1 + lam * xt2
+        for i in tqdm(reversed(range(0, t)), desc='interpolation sample time step', total=t):
+            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
+
+        return img
+
+    def q_sample(self, x_start, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def p_losses(self, x_start, t, noise = None):
+        b, c, h, w = x_start.shape
+        noise = default(noise, lambda: torch.randn_like(x_start))
+
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        x_recon, step = self.denoise_fn(x_noisy, t)
+
+        criterion = torch.nn.CrossEntropyLoss().cuda()
+        loss_step = criterion(step, t)
+
+        _, predicted = step.max(1)
+        correct = predicted.eq(t).sum().item()
+
+        if self.loss_type == 'l1':
+            loss = (noise - x_recon).abs().mean()
+        elif self.loss_type == 'l2':
+            loss = F.mse_loss(noise, x_recon)
+        else:
+            raise NotImplementedError()
+
+        return loss, loss_step, correct
+
+    def forward(self, x, *args, **kwargs):
+        b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
+        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        return self.p_losses(x, t, *args, **kwargs)
+
 
 class Dataset(data.Dataset):
     def __init__(self, folder, image_size, exts = ['jpg', 'jpeg', 'png', 'JPEG']):
@@ -589,10 +851,10 @@ class Trainer(object):
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
                 data = next(self.dl).cuda()
-                loss1, loss2 = self.model(data)
-                print(f'{self.step}: {loss1.item()}, {loss2.item()}')
-                loss = loss1 + loss2
-                backwards((loss) / self.gradient_accumulate_every, self.opt)
+                loss_recons, loss_step, correct = self.model(data)
+                loss = loss_recons + loss_step
+                print(f'{self.step}: {loss_recons.item()}, {loss_step.item()}, {correct}')
+                backwards(loss / self.gradient_accumulate_every, self.opt)
 
             self.opt.step()
             self.opt.zero_grad()
@@ -612,3 +874,102 @@ class Trainer(object):
             self.step += 1
 
         print('training completed')
+
+
+    def test(self):
+
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # temp = all_images
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test.png'), nrow = 6)
+        #
+        # temp1 = temp + 0.01*torch.randn_like(temp)
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp1), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test-1.png'), nrow=6)
+        #
+        # temp2 = temp + 0.1 * torch.randn_like(temp)
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp2), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test-2.png'), nrow=6)
+        #
+        # temp3 = temp + 0.5 * torch.randn_like(temp)
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp3), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test-3.png'), nrow=6)
+        #
+        # temp4 = temp + 1.0 * torch.randn_like(temp)
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp4), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test-4.png'), nrow=6)
+        #
+        # temp5 = temp + 1.5 * torch.randn_like(temp)
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp5), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test-5.png'), nrow=6)
+        #
+        # temp6 = temp + 2.0 * torch.randn_like(temp)
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp6), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test-6.png'), nrow=6)
+        #
+        # temp7 = temp + 4.0 * torch.randn_like(temp)
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp7), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test-7.png'), nrow=6)
+        #
+        # temp8 = torch.ones_like(temp) * 2 - 1
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp8), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test-ones.png'), nrow=6)
+        #
+        # temp9 = torch.zeros_like(temp) * 2 - 1
+        # batches = num_to_groups(36, self.batch_size)
+        # all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp9), batches))
+        # all_images = torch.cat(all_images_list, dim=0)
+        # all_images = (all_images + 1) * 0.5
+        # utils.save_image(all_images, str(self.results_folder / f'sample-test-zeros.png'), nrow=6)
+
+
+        batches = num_to_groups(36, self.batch_size)
+        all_images_list = list(map(lambda n: self.ema_model.sample_opt(batch_size=n), batches))
+        all_images = torch.cat(all_images_list, dim=0)
+        temp = all_images
+        all_images = (all_images + 1) * 0.5
+        utils.save_image(all_images, str(self.results_folder / f'sample-test-8.png'), nrow=6)
+
+        temp9 = temp + torch.randn_like(temp)
+        batches = num_to_groups(36, self.batch_size)
+        all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp9), batches))
+        all_images = torch.cat(all_images_list, dim=0)
+        all_images = (all_images + 1) * 0.5
+        utils.save_image(all_images, str(self.results_folder / f'sample-test-9.png'), nrow=6)
+
+
+        batches = num_to_groups(36, self.batch_size)
+        all_images_list = list(map(lambda n: self.ema_model.sample_x0(batch_size=n), batches))
+        all_images = torch.cat(all_images_list, dim=0)
+        temp = all_images
+        all_images = (all_images + 1) * 0.5
+        utils.save_image(all_images, str(self.results_folder / f'sample-test-10.png'), nrow=6)
+
+        print('testing completed')
+

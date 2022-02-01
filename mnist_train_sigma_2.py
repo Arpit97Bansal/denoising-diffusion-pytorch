@@ -39,7 +39,7 @@ model = Unet(
     dim = 64,
     dim_mults = (1, 2, 4, 8),
     image_size = 32,
-    with_time_emb = False
+    with_time_emb = True
 ).cuda()
 
 
@@ -54,13 +54,13 @@ trainer = Trainer(
     diffusion,
     './root_mnist/',
     image_size = 32,
-    train_batch_size = 64,
+    train_batch_size = 32,
     train_lr = 2e-5,
     train_num_steps = 700000,         # total training steps
     gradient_accumulate_every = 2,    # gradient accumulation steps
     ema_decay = 0.995,                # exponential moving average decay
     fp16 = True,                       # turn on mixed precision training with apex
-    results_folder = './results_mnist_sigma'
+    results_folder = './results_mnist_sigma_2'
 )
 
 trainer.train()
