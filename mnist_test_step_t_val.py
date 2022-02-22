@@ -1,4 +1,5 @@
 from denoising_diffusion_pytorch_step_t_val import Unet, GaussianDiffusion, Trainer, GaussianDiffusionIter
+from mnist_models import ResNet18
 import torchvision
 import os
 import errno
@@ -24,6 +25,20 @@ if create:
     trainset = torchvision.datasets.MNIST(
             root='./data', train=True, download=True)
     root = './root_mnist/'
+    del_folder(root)
+    create_folder(root)
+
+    for i in range(10):
+        lable_root = root + str(i) + '/'
+        create_folder(lable_root)
+
+    for idx in range(len(trainset)):
+        img, label = trainset[idx]
+        img.save(root + str(label) + '/' + str(idx) + '.png')
+
+    trainset = torchvision.datasets.MNIST(
+        root='./data', train=False, download=True)
+    root = './root_mnist_test/'
     del_folder(root)
     create_folder(root)
 
@@ -78,7 +93,14 @@ trainer = Trainer(
     ema_decay = 0.995,                # exponential moving average decay
     fp16 = False,                       # turn on mixed precision training with apex
     results_folder = './results_mnist_step_t_val',
-    do_load = True
+    do_load = True,
+    test_folder='./root_mnist_test/'
 )
 
-trainer.test()
+
+trainer.test_denoise()
+#trainer.test()
+# model = ResNet18()
+# lr = 0.001
+# #trainer.train_predictor(model, lr)
+# trainer.test_adversarial(model)

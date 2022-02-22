@@ -5,7 +5,7 @@
       <webServer id="f75b4fc9-3af8-4f63-b5dd-f00b9a7d78c2" name="cmlsub00.umiacs.umd.edu">
         <fileTransfer rootFolder="/cmlscratch/bansal01/spring_2022/" accessType="SFTP" host="cmlsub00.umiacs.umd.edu" port="22" sshConfigId="9e55c19c-fb83-48ea-bff1-6fcd450386c8" sshConfig="bansal01@cmlsub00.umiacs.umd.edu:22 password">
           <advancedOptions>
-            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
           </advancedOptions>
         </fileTransfer>
       </webServer>

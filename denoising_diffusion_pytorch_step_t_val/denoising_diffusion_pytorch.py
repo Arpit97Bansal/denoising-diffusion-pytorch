@@ -11,6 +11,8 @@ from torch.autograd import Variable
 from pathlib import Path
 from torch.optim import Adam
 from torchvision import transforms, utils
+import torchvision
+#import torchattacks
 from PIL import Image
 
 import numpy as np
@@ -905,7 +907,8 @@ class Trainer(object):
         update_ema_every = 10,
         save_and_sample_every = 1000,
         results_folder = './results',
-        do_load = False
+        do_load = False,
+        test_folder = None
     ):
         super().__init__()
         self.model = diffusion_model
@@ -922,6 +925,18 @@ class Trainer(object):
         self.train_num_steps = train_num_steps
 
         self.ds = Dataset(folder, image_size)
+        if test_folder != None:
+            self.transform = transforms.Compose([
+                transforms.Resize(image_size),
+                # transforms.RandomHorizontalFlip(),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor()
+            ])
+            self.train_ds = torchvision.datasets.ImageFolder(root=folder, transform=self.transform)
+            self.test_ds = torchvision.datasets.ImageFolder(root=test_folder, transform=self.transform)
+        else:
+            self.train_ds = None
+            self.test_ds = None
         #print("Debug", len(self.ds))
         self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, pin_memory=True))
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
@@ -1003,6 +1018,59 @@ class Trainer(object):
             self.step += 1
 
         print('training completed')
+
+
+    def train_predictor(self, model, lr):
+        model = model.cuda()
+        train_loader = torch.utils.data.DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, pin_memory=True)
+        test_loader = torch.utils.data.DataLoader(self.test_ds, batch_size=self.batch_size, shuffle=True, pin_memory=True)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        for epoch in range(5):
+            running_loss=0
+            train_accuracy=0
+            test_accuracy=0
+
+            for i, data in enumerate(train_loader, 0):
+                inputs, labels = data
+                inputs, labels = inputs.cuda(), labels.cuda()
+
+                outputs = model(inputs)
+
+                loss = criterion(outputs, labels)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
+                max_vals, max_indices = torch.max(outputs, 1)
+                correct = (max_indices == labels).sum().data.cpu().numpy() / max_indices.size()[0]
+                train_accuracy += 100 * correct
+
+            running_loss /= len(train_loader)
+            train_accuracy /= len(train_loader)
+            model.eval()
+
+            for i, data in enumerate(test_loader, 0):
+                inputs, labels = data
+                inputs, labels = inputs.cuda(), labels.cuda()
+                outputs = model(inputs)
+                max_vals, max_indices = torch.max(outputs, 1)
+                correct = (max_indices == labels).sum().data.cpu().numpy() / max_indices.size()[0]
+                test_accuracy += 100 * correct
+
+            test_accuracy /= len(test_loader)
+
+            print(epoch)
+            print(running_loss, train_accuracy, test_accuracy)
+
+            data = {
+                'model': model.state_dict()
+            }
+            torch.save(data, str(self.results_folder / f'model-prediction.pt'))
+
 
 
     def test(self):
@@ -1142,3 +1210,138 @@ class Trainer(object):
 
         print('testing completed')
 
+    def test_denoise(self):
+        print("Test")
+        test_loader = torch.utils.data.DataLoader(self.test_ds, batch_size=self.batch_size, shuffle=True,
+                                                  pin_memory=True)
+        for i, data in enumerate(test_loader, 0):
+            inputs, labels = data
+            inputs, labels = inputs.cuda(), labels.cuda()
+            all_images = inputs
+            all_images = all_images * 2 - 1
+            break
+
+        temp = all_images
+        all_images = (all_images + 1) * 0.5
+        utils.save_image(all_images, str(self.results_folder / f'original.png'), nrow=6)
+
+        print("Add noise of 0.5 to Normal")
+        temp3 = temp + 0.5 * torch.randn_like(temp)
+        all_images = (temp3 + 1) * 0.5
+        utils.save_image(all_images, str(self.results_folder / f'original_noise_0_5.png'), nrow=6)
+
+        batches = [self.batch_size]
+        all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp3), batches))
+        all_images = torch.cat(all_images_list, dim=0)
+        all_images = (all_images + 1) * 0.5
+        utils.save_image(all_images, str(self.results_folder / f'original_denoise_0_5.png'), nrow=6)
+
+        print("Add noise of 1.0 to Normal")
+        temp3 = temp + 1.0 * torch.randn_like(temp)
+        all_images = (temp3 + 1) * 0.5
+        utils.save_image(all_images, str(self.results_folder / f'original_noise_1_0.png'), nrow=6)
+
+        batches = [self.batch_size]
+        all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=temp3), batches))
+        all_images = torch.cat(all_images_list, dim=0)
+        all_images = (all_images + 1) * 0.5
+        utils.save_image(all_images, str(self.results_folder / f'original_denoise_1_0.png'), nrow=6)
+
+    def test_adversarial(self, model):
+
+        import torchattacks
+
+        model = model.cuda()
+        train_loader = torch.utils.data.DataLoader(self.test_ds, batch_size=self.batch_size, shuffle=True,
+                                                   pin_memory=True)
+
+        data = torch.load(str(self.results_folder / f'model-prediction.pt'))
+        model.load_state_dict(data['model'])
+        model.eval()
+        #atk = torchattacks.PGD(model, eps=12 / 255, alpha=1 / 255, steps=40)
+        atk = torchattacks.CW(model, c=2)
+
+        orig_acc = 0
+        adv_acc = 0
+        dn_acc = 0
+        adv_dn_acc = 0
+        cnt = 0
+
+        for i, data in enumerate(train_loader, 0):
+            inputs, labels = data
+            inputs, labels = inputs.cuda(), labels.cuda()
+            outputs = model(inputs)
+
+            max_vals, max_indices = torch.max(outputs, 1)
+            correct = (max_indices == labels).sum().data.cpu().numpy() / max_indices.size()[0]
+            orig_acc += 100 * correct
+            if i==0:
+                print("Original Prediction")
+                print(correct)
+                utils.save_image(inputs, str(self.results_folder / f'original.png'), nrow=6)
+
+            adv_images = atk(inputs, labels)
+            outputs = model(adv_images)
+            max_vals, max_indices = torch.max(outputs, 1)
+            correct = (max_indices == labels).sum().data.cpu().numpy() / max_indices.size()[0]
+            adv_acc += 100*correct
+            if i==0:
+                print("Adversarial Prediction")
+                print(correct)
+                utils.save_image(inputs, str(self.results_folder / f'adversarial.png'), nrow=6)
+
+
+
+
+            batches = [self.batch_size]
+            #convert this original image to same input as for diffusion
+            inputs = inputs*2 - 1
+            inp_noisy = inputs + 1.0 * torch.randn_like(inputs)
+            all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=inp_noisy), batches))
+            all_images = torch.cat(all_images_list, dim=0)
+            all_images = (all_images + 1) * 0.5
+            if i==0:
+                utils.save_image(all_images, str(self.results_folder / f'original_denoise_1_0.png'), nrow=6)
+
+            outputs = model(all_images)
+            max_vals, max_indices = torch.max(outputs, 1)
+            correct = (max_indices == labels).sum().data.cpu().numpy() / max_indices.size()[0]
+            dn_acc += 100 * correct
+            if i==0:
+                print("Original Denoise Prediction")
+                print(correct)
+
+
+
+
+            adv_images = adv_images * 2 - 1
+            adv_noisy = adv_images + 1.0 * torch.randn_like(adv_images)
+            all_images_list = list(map(lambda n: self.ema_model.sample_from_img(batch_size=n, img=adv_noisy), batches))
+            all_images = torch.cat(all_images_list, dim=0)
+            all_images = (all_images + 1) * 0.5
+            if i==0:
+                utils.save_image(all_images, str(self.results_folder / f'adversarial_denoise_1_0.png'), nrow=6)
+
+            outputs = model(all_images)
+            max_vals, max_indices = torch.max(outputs, 1)
+            correct = (max_indices == labels).sum().data.cpu().numpy() / max_indices.size()[0]
+            adv_dn_acc += 100 * correct
+            if i==0:
+                print("Adversarial Denoise Prediction")
+                print(correct)
+
+            cnt+= 1
+            print("Count")
+            print(cnt)
+
+            print("Original Accuracy")
+            print(orig_acc/cnt)
+
+            print("Adversarial Accuracy")
+            print(adv_acc/cnt)
+
+            print("Denoised Accuracy")
+            print(dn_acc/cnt)
+
+            print("Denoised Adversarial Accuracy")
+            print(adv_dn_acc/cnt)
